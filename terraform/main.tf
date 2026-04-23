@@ -12,92 +12,105 @@ provider "aws" {
   region = var.aws_region
 }
 
-# IAM Role para EC2
-resource "aws_iam_role" "payment_service_role" {
-  name = "payment-service-role-${var.stage}"
+data "aws_caller_identity" "current" {}
+
+# ZIP del código incluyendo node_modules
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/../"
+  output_path = "${path.module}/payment-service.zip"
+  excludes    = ["terraform", ".git", ".env", "*.pem", ".gitignore"]
+}
+
+# IAM Role para Lambda
+resource "aws_iam_role" "payment_lambda_role" {
+  name = "payment-service-lambda-role-${var.stage}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Action    = "sts:AssumeRole"
       Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
+      Principal = { Service = "lambda.amazonaws.com" }
     }]
   })
 }
 
 resource "aws_iam_role_policy_attachment" "dynamo_access" {
-  role       = aws_iam_role.payment_service_role.name
+  role       = aws_iam_role.payment_lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
 }
 
 resource "aws_iam_role_policy_attachment" "sqs_access" {
-  role       = aws_iam_role.payment_service_role.name
+  role       = aws_iam_role.payment_lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSQSFullAccess"
 }
 
-resource "aws_iam_instance_profile" "payment_service_profile" {
-  name = "payment-service-profile-${var.stage}"
-  role = aws_iam_role.payment_service_role.name
+resource "aws_iam_role_policy_attachment" "lambda_logs" {
+  role       = aws_iam_role.payment_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# Security Group
-resource "aws_security_group" "payment_service_sg" {
-  name        = "payment-service-sg-${var.stage}"
-  description = "Security group for payment service EC2"
-  vpc_id      = var.vpc_id
+# Lambda
+resource "aws_lambda_function" "payment_service" {
+  filename         = data.archive_file.lambda_zip.output_path
+  function_name    = "payment-service-${var.stage}"
+  role             = aws_iam_role.payment_lambda_role.arn
+  handler          = "src/app.handler"
+  runtime          = "nodejs20.x"
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  timeout          = 30
 
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 3000
-    to_port     = 3000
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "payment-service-sg-${var.stage}"
+  environment {
+    variables = {
+      AWS_NODEJS_CONNECTION_REUSE_ENABLED = "1"
+      SQS_QUEUE_URL                       = var.sqs_queue_url
+      DYNAMO_TABLE_NAME                   = var.dynamo_table_name
+    }
   }
 }
 
-# EC2
-resource "aws_instance" "payment_service" {
-  ami                         = "ami-0c1e21d82fe9c9336" 
-  instance_type               = "t3.micro"
-  subnet_id                   = var.subnet_id
-  vpc_security_group_ids      = [aws_security_group.payment_service_sg.id]
-  iam_instance_profile        = aws_iam_instance_profile.payment_service_profile.name
-  associate_public_ip_address = true
-  key_name                    = var.key_pair_name
+# API Gateway
+resource "aws_apigatewayv2_api" "payment_api" {
+  name          = "payment-service-api-${var.stage}"
+  protocol_type = "HTTP"
+}
 
-  user_data = <<-EOF
-    #!/bin/bash
-    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-    yum install -y nodejs git
-    mkdir -p /home/ec2-user/payment-service
-    cat > /home/ec2-user/payment-service/.env << 'ENVFILE'
-    PORT=3000
-    AWS_REGION=${var.aws_region}
-    SQS_QUEUE_URL=${var.sqs_queue_url}
-    DYNAMO_TABLE_NAME=${var.dynamo_table_name}
-    ENVFILE
-    npm install -g pm2
-  EOF
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+  api_id                 = aws_apigatewayv2_api.payment_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.payment_service.invoke_arn
+  payload_format_version = "2.0"
+}
 
-  tags = {
-    Name = "payment-service-${var.stage}"
-  }
+resource "aws_apigatewayv2_route" "post_payment" {
+  api_id    = aws_apigatewayv2_api.payment_api.id
+  route_key = "POST /api/payment"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_payment" {
+  api_id    = aws_apigatewayv2_api.payment_api.id
+  route_key = "GET /api/payment/{traceId}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "health" {
+  api_id    = aws_apigatewayv2_api.payment_api.id
+  route_key = "GET /health"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.payment_api.id
+  name        = "$default"
+  auto_deploy = true
+}
+
+resource "aws_lambda_permission" "api_gateway" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.payment_service.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.payment_api.execution_arn}/*/*"
 }

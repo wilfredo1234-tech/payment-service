@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const serverless = require('serverless-http');
 
 // Adaptadores
 const DynamoCardAdapter = require('./infrastructure/output/dynamo-card.adapter');
@@ -32,7 +33,6 @@ const paymentController = new PaymentHttpController({ createPaymentUseCase, quer
 app.use('/api', paymentController.router);
 
 // Health check
-
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
@@ -48,9 +48,13 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Error interno del servidor' });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`payment-service corriendo en el puerto ${PORT}`);
-});
+// Local
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`payment-service corriendo en el puerto ${PORT}`);
+  });
+}
 
-module.exports = app;
+// Lambda
+module.exports.handler = serverless(app);

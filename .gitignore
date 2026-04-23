@@ -9,5 +9,7 @@ terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/terraform.tfvars
 
+terraform/payment-service.zip
+
 # Keys
 *.pem
